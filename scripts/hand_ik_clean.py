@@ -236,10 +236,21 @@ class HandIKTrainer:
     """
     手部逆运动学训练器
     """
-    def __init__(self, model, rest_joints, device='cuda', learning_rate=0.001):
+    def __init__(self, model, rest_joints, device='cuda', learning_rate=0.001, loss_type='combined'):
+        """
+        初始化训练器
+        
+        Args:
+            loss_type: 'keypoints_only' 或 'combined'
+                - 'keypoints_only': 只使用关键点损失
+                - 'combined': 使用轴损失 + 角度损失 + 0.1*关键点损失
+        """
         self.model = model.to(device)
         self.rest_joints = torch.FloatTensor(rest_joints).to(device)
         self.device = device
+        self.loss_type = loss_type
+        
+        print(f"Loss type: {loss_type}")
         
         self.optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -252,7 +263,7 @@ class HandIKTrainer:
         
     def forward_kinematics_loss(self, pred_poses, target_keypoints):
         """
-        正运动学一致性损失
+        正运动学一致性损失（关键点loss）
         """
         batch_size = pred_poses.shape[0]
         
@@ -271,12 +282,62 @@ class HandIKTrainer:
         
         return loss, pred_keypoints_flat
     
+    def axis_angle_loss(self, pred_poses, true_poses):
+        """
+        轴角度损失：分别计算轴方向损失和角度大小损失
+        """
+        batch_size = pred_poses.shape[0]
+        
+        # 重塑为 [batch, 16, 3]
+        pred_reshaped = pred_poses.view(batch_size, 16, 3)
+        true_reshaped = true_poses.view(batch_size, 16, 3)
+        
+        # 计算角度大小（旋转向量的模长）
+        pred_angles = torch.norm(pred_reshaped + 1e-8, dim=2)  # [batch, 16]
+        true_angles = torch.norm(true_reshaped + 1e-8, dim=2)  # [batch, 16]
+        
+        # 角度损失
+        angle_loss = torch.mean((pred_angles - true_angles) ** 2)
+        
+        # 计算轴方向（归一化的旋转向量）
+        pred_axes = pred_reshaped / (torch.norm(pred_reshaped, dim=2, keepdim=True) + 1e-8)
+        true_axes = true_reshaped / (torch.norm(true_reshaped, dim=2, keepdim=True) + 1e-8)
+        
+        # 轴方向损失（使用余弦相似度）
+        cosine_sim = torch.sum(pred_axes * true_axes, dim=2)  # [batch, 16]
+        axis_loss = torch.mean((1 - cosine_sim) ** 2)  # 1-cos(θ)，当方向相同时为0
+        
+        return axis_loss, angle_loss
+    
+    def compute_keypoints_only_loss(self, pred_poses, target_keypoints):
+        """
+        计算只有关键点的损失
+        """
+        keypoint_loss, pred_keypoints = self.forward_kinematics_loss(pred_poses, target_keypoints)
+        return keypoint_loss, pred_keypoints
+    
+    def compute_combined_loss(self, pred_poses, true_poses, target_keypoints):
+        """
+        计算组合损失：轴损失 + 角度损失 + 0.1 * 关键点损失
+        """
+        # 轴角度损失
+        axis_loss, angle_loss = self.axis_angle_loss(pred_poses, true_poses)
+        
+        # 关键点损失
+        keypoint_loss, pred_keypoints = self.forward_kinematics_loss(pred_poses, target_keypoints)
+        
+        # 组合损失
+        total_loss = axis_loss + angle_loss + 0.1 * keypoint_loss
+        
+        return total_loss, axis_loss, angle_loss, keypoint_loss, pred_keypoints
+    
     def train_epoch(self, dataloader):
         """训练一个epoch"""
         self.model.train()
         total_loss = 0
-        total_param_loss = 0
-        total_fk_loss = 0
+        total_axis_loss = 0
+        total_angle_loss = 0
+        total_keypoint_loss = 0
         
         # 添加进度条
         pbar = tqdm(dataloader, desc="Training", leave=False)
@@ -287,44 +348,57 @@ class HandIKTrainer:
             # 前向传播
             pred_poses = self.model(keypoints)
             
-            # 参数损失（L2）
-            param_loss = torch.mean((pred_poses - pose_params) ** 2)
-            
-            # 正运动学一致性损失
-            fk_loss, _ = self.forward_kinematics_loss(pred_poses, keypoints)
-            
-            # 总损失
-            total_batch_loss = param_loss + 0.1 * fk_loss
+            # 根据损失类型计算损失
+            if self.loss_type == 'keypoints_only':
+                batch_loss, _ = self.compute_keypoints_only_loss(pred_poses, keypoints)
+                axis_loss = angle_loss = 0.0
+                keypoint_loss = batch_loss.item()
+            else:  # combined loss
+                batch_loss, axis_loss, angle_loss, keypoint_loss, _ = self.compute_combined_loss(
+                    pred_poses, pose_params, keypoints)
+                axis_loss = axis_loss.item()
+                angle_loss = angle_loss.item()
+                keypoint_loss = keypoint_loss.item()
             
             # 反向传播
             self.optimizer.zero_grad()
-            total_batch_loss.backward()
+            batch_loss.backward()
             
             # 梯度裁剪
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             
             self.optimizer.step()
             
-            total_loss += total_batch_loss.item()
-            total_param_loss += param_loss.item()
-            total_fk_loss += fk_loss.item()
+            total_loss += batch_loss.item()
+            total_axis_loss += axis_loss
+            total_angle_loss += angle_loss
+            total_keypoint_loss += keypoint_loss
             
             # 更新进度条显示
-            pbar.set_postfix({
-                'Loss': f'{total_batch_loss.item():.4f}',
-                'Param': f'{param_loss.item():.4f}',
-                'FK': f'{fk_loss.item():.4f}'
-            })
+            if self.loss_type == 'keypoints_only':
+                pbar.set_postfix({
+                    'Loss': f'{batch_loss.item():.4f}',
+                    'Keypoint': f'{keypoint_loss:.4f}'
+                })
+            else:
+                pbar.set_postfix({
+                    'Loss': f'{batch_loss.item():.4f}',
+                    'Axis': f'{axis_loss:.4f}',
+                    'Angle': f'{angle_loss:.4f}',
+                    'Keypoint': f'{keypoint_loss:.4f}'
+                })
         
         n_batches = len(dataloader)
-        return total_loss/n_batches, total_param_loss/n_batches, total_fk_loss/n_batches
+        return (total_loss/n_batches, total_axis_loss/n_batches, 
+                total_angle_loss/n_batches, total_keypoint_loss/n_batches)
     
     def validate_with_analysis(self, dataloader):
         """验证并进行详细分析"""
         self.model.eval()
         total_loss = 0
-        total_param_loss = 0
-        total_fk_loss = 0
+        total_axis_loss = 0
+        total_angle_loss = 0 
+        total_keypoint_loss = 0
         
         # 收集预测结果用于分析
         all_pred_poses = []
@@ -341,14 +415,22 @@ class HandIKTrainer:
                 
                 pred_poses = self.model(keypoints)
                 
-                param_loss = torch.mean((pred_poses - pose_params) ** 2)
-                fk_loss, pred_keypoints = self.forward_kinematics_loss(pred_poses, keypoints)
+                # 根据损失类型计算损失
+                if self.loss_type == 'keypoints_only':
+                    batch_loss, pred_keypoints = self.compute_keypoints_only_loss(pred_poses, keypoints)
+                    axis_loss = angle_loss = 0.0
+                    keypoint_loss = batch_loss.item()
+                else:  # combined loss
+                    batch_loss, axis_loss, angle_loss, keypoint_loss, pred_keypoints = self.compute_combined_loss(
+                        pred_poses, pose_params, keypoints)
+                    axis_loss = axis_loss.item()
+                    angle_loss = angle_loss.item()
+                    keypoint_loss = keypoint_loss.item()
                 
-                total_batch_loss = param_loss + 0.1 * fk_loss
-                
-                total_loss += total_batch_loss.item()
-                total_param_loss += param_loss.item()
-                total_fk_loss += fk_loss.item()
+                total_loss += batch_loss.item()
+                total_axis_loss += axis_loss
+                total_angle_loss += angle_loss
+                total_keypoint_loss += keypoint_loss
                 
                 # 收集数据用于分析
                 all_pred_poses.append(pred_poses.cpu())
@@ -360,16 +442,25 @@ class HandIKTrainer:
                 joint_errors = torch.abs(pred_poses - pose_params).cpu()
                 all_joint_errors.append(joint_errors)
                 
-                pbar.set_postfix({
-                    'Loss': f'{total_batch_loss.item():.4f}',
-                    'Param': f'{param_loss.item():.4f}',
-                    'FK': f'{fk_loss.item():.4f}'
-                })
+                # 更新进度条显示
+                if self.loss_type == 'keypoints_only':
+                    pbar.set_postfix({
+                        'Loss': f'{batch_loss.item():.4f}',
+                        'Keypoint': f'{keypoint_loss:.4f}'
+                    })
+                else:
+                    pbar.set_postfix({
+                        'Loss': f'{batch_loss.item():.4f}',
+                        'Axis': f'{axis_loss:.4f}',
+                        'Angle': f'{angle_loss:.4f}',
+                        'Keypoint': f'{keypoint_loss:.4f}'
+                    })
         
         n_batches = len(dataloader)
         avg_loss = total_loss/n_batches
-        avg_param_loss = total_param_loss/n_batches
-        avg_fk_loss = total_fk_loss/n_batches
+        avg_axis_loss = total_axis_loss/n_batches
+        avg_angle_loss = total_angle_loss/n_batches
+        avg_keypoint_loss = total_keypoint_loss/n_batches
         
         # 合并所有数据
         all_pred_poses = torch.cat(all_pred_poses, dim=0)  # [N, 48]
@@ -381,8 +472,9 @@ class HandIKTrainer:
         # 计算统计信息
         stats = {
             'avg_loss': avg_loss,
-            'avg_param_loss': avg_param_loss,
-            'avg_fk_loss': avg_fk_loss,
+            'avg_axis_loss': avg_axis_loss,
+            'avg_angle_loss': avg_angle_loss,
+            'avg_keypoint_loss': avg_keypoint_loss,
             'pred_poses': all_pred_poses,
             'true_poses': all_true_poses,
             'pred_keypoints': all_pred_keypoints,
@@ -391,7 +483,7 @@ class HandIKTrainer:
             'keypoint_errors': torch.abs(all_pred_keypoints - all_true_keypoints)
         }
         
-        return avg_loss, avg_param_loss, avg_fk_loss, stats
+        return avg_loss, avg_axis_loss, avg_angle_loss, avg_keypoint_loss, stats
     
     def plot_validation_analysis(self, stats, epoch):
         """绘制验证分析图表"""
@@ -532,7 +624,7 @@ class HandIKTrainer:
         
         plt.tight_layout()
         plt.suptitle(f'Validation Analysis - Epoch {epoch}', fontsize=16, y=0.98)
-        plt.savefig(f'validation_analysis_epoch_{epoch:03d}.png', dpi=150, bbox_inches='tight')
+        plt.savefig(f'../results_handik/validation_analysis_combined_epoch_{epoch:03d}.png', dpi=150, bbox_inches='tight')
         plt.close()  # 关闭图形，释放内存，不显示
         
         # 打印统计摘要
@@ -557,6 +649,7 @@ class HandIKTrainer:
         """训练模型"""
         print("Starting hand inverse kinematics training...")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        print(f"Loss type: {self.loss_type}")
         
         best_val_loss = float('inf')
         patience_counter = 0
@@ -566,18 +659,18 @@ class HandIKTrainer:
         epoch_pbar = tqdm(range(epochs), desc="Training Progress")
         for epoch in epoch_pbar:
             # 训练
-            train_loss, train_param_loss, train_fk_loss = self.train_epoch(train_loader)
+            train_loss, train_axis_loss, train_angle_loss, train_keypoint_loss = self.train_epoch(train_loader)
             
             # 验证 - 使用详细分析
             if epoch % plot_frequency == 0 or epoch == epochs - 1:
-                val_loss, val_param_loss, val_fk_loss, stats = self.validate_with_analysis(val_loader)
+                val_loss, val_axis_loss, val_angle_loss, val_keypoint_loss, stats = self.validate_with_analysis(val_loader)
                 
                 # 绘制验证分析图
                 analysis_stats = self.plot_validation_analysis(stats, epoch)
                 self.epoch_stats.append(analysis_stats)
             else:
                 # 快速验证，不进行详细分析
-                val_loss, val_param_loss, val_fk_loss = self.validate_simple(val_loader)
+                val_loss, val_axis_loss, val_angle_loss, val_keypoint_loss = self.validate_simple(val_loader)
             
             # 记录损失
             self.train_losses.append(train_loss)
@@ -595,18 +688,31 @@ class HandIKTrainer:
                 patience_counter += 1
             
             # 更新epoch进度条显示
-            epoch_pbar.set_postfix({
-                'Train': f'{train_loss:.4f}',
-                'Val': f'{val_loss:.4f}',
-                'Best': f'{best_val_loss:.4f}',
-                'LR': f'{self.optimizer.param_groups[0]["lr"]:.2e}',
-                'Patience': f'{patience_counter}/{max_patience}'
-            })
+            if self.loss_type == 'keypoints_only':
+                epoch_pbar.set_postfix({
+                    'Train': f'{train_loss:.4f}',
+                    'Val': f'{val_loss:.4f}',
+                    'Best': f'{best_val_loss:.4f}',
+                    'LR': f'{self.optimizer.param_groups[0]["lr"]:.2e}',
+                    'Patience': f'{patience_counter}/{max_patience}'
+                })
+            else:
+                epoch_pbar.set_postfix({
+                    'Train': f'{train_loss:.4f}',
+                    'Val': f'{val_loss:.4f}',
+                    'Best': f'{best_val_loss:.4f}',
+                    'LR': f'{self.optimizer.param_groups[0]["lr"]:.2e}',
+                    'Patience': f'{patience_counter}/{max_patience}'
+                })
             
             # 详细打印（减少频率）
             if epoch % 10 == 0 or epoch == epochs - 1:
-                tqdm.write(f"Epoch {epoch:3d}: Train={train_loss:.6f}, Val={val_loss:.6f}, "
-                          f"Param={val_param_loss:.6f}, FK={val_fk_loss:.6f}")
+                if self.loss_type == 'keypoints_only':
+                    tqdm.write(f"Epoch {epoch:3d}: Train={train_loss:.6f}, Val={val_loss:.6f}, "
+                              f"Keypoint={val_keypoint_loss:.6f}")
+                else:
+                    tqdm.write(f"Epoch {epoch:3d}: Train={train_loss:.6f}, Val={val_loss:.6f}, "
+                              f"Axis={val_axis_loss:.6f}, Angle={val_angle_loss:.6f}, Keypoint={val_keypoint_loss:.6f}")
             
             # 早停
             if patience_counter >= max_patience:
@@ -621,8 +727,9 @@ class HandIKTrainer:
         """简单验证，不进行详细分析"""
         self.model.eval()
         total_loss = 0
-        total_param_loss = 0
-        total_fk_loss = 0
+        total_axis_loss = 0
+        total_angle_loss = 0
+        total_keypoint_loss = 0
         
         with torch.no_grad():
             for keypoints, pose_params in dataloader:
@@ -631,17 +738,26 @@ class HandIKTrainer:
                 
                 pred_poses = self.model(keypoints)
                 
-                param_loss = torch.mean((pred_poses - pose_params) ** 2)
-                fk_loss, _ = self.forward_kinematics_loss(pred_poses, keypoints)
+                # 根据损失类型计算损失
+                if self.loss_type == 'keypoints_only':
+                    batch_loss, _ = self.compute_keypoints_only_loss(pred_poses, keypoints)
+                    axis_loss = angle_loss = 0.0
+                    keypoint_loss = batch_loss.item()
+                else:  # combined loss
+                    batch_loss, axis_loss, angle_loss, keypoint_loss, _ = self.compute_combined_loss(
+                        pred_poses, pose_params, keypoints)
+                    axis_loss = axis_loss.item()
+                    angle_loss = angle_loss.item()
+                    keypoint_loss = keypoint_loss.item()
                 
-                total_batch_loss = param_loss + 0.1 * fk_loss
-                
-                total_loss += total_batch_loss.item()
-                total_param_loss += param_loss.item()
-                total_fk_loss += fk_loss.item()
+                total_loss += batch_loss.item()
+                total_axis_loss += axis_loss
+                total_angle_loss += angle_loss
+                total_keypoint_loss += keypoint_loss
         
         n_batches = len(dataloader)
-        return total_loss/n_batches, total_param_loss/n_batches, total_fk_loss/n_batches
+        return (total_loss/n_batches, total_axis_loss/n_batches, 
+                total_angle_loss/n_batches, total_keypoint_loss/n_batches)
     
     def plot_training_curves(self):
         """绘制训练曲线"""
@@ -659,9 +775,17 @@ class HandIKTrainer:
         plt.savefig('training_curves.png', dpi=150, bbox_inches='tight')
         plt.close()  # 关闭图形，不显示
 
-def main():
-    """主训练函数"""
+def main(loss_type='combined'):
+    """
+    主训练函数
+    
+    Args:
+        loss_type: 'keypoints_only' 或 'combined'
+            - 'keypoints_only': 只使用关键点损失 (forward kinematics loss)
+            - 'combined': 使用轴损失 + 角度损失 + 0.1*关键点损失
+    """
     print("=== MANO Hand Inverse Kinematics Training ===")
+    print(f"Loss type: {loss_type}")
     
     # 设备配置
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -687,8 +811,8 @@ def main():
     model = IKNet(input_dim=63, output_dim=48)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     
-    # 创建训练器
-    trainer = HandIKTrainer(model, rest_joints, device=device, learning_rate=0.001)
+    # 创建训练器 - 指定损失类型
+    trainer = HandIKTrainer(model, rest_joints, device=device, learning_rate=0.001, loss_type=loss_type)
     
     # 开始训练
     trainer.train(train_loader, val_loader, epochs=2000, plot_frequency=20)  # 每20个epoch绘制一次分析图  
@@ -700,4 +824,7 @@ def main():
     print("Model saved as 'best_hand_ik_model.pth'")
 
 if __name__ == "__main__":
-    main()
+    # 可以在这里选择损失类型
+    # 'keypoints_only': 只有关键点损失
+    # 'combined': 轴损失 + 角度损失 + 0.1*关键点损失
+    main(loss_type='combined')  # 默认使用组合损失
